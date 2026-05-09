@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""
+CATO — Claude Autonomous Task Orchestrator
+
+WHAT IT DOES:
+  Harvests productive work from Claude's 5-hour rate-limit windows.  On each
+  fresh window (LIMITED → READY transition) CATO pulls open tasks from the
+  tdo/claude/tdo.md, asks a selector model to pick
+  the most impactful N, executes them via the `claude` CLI in non-interactive
+  batch mode, and appends a session log to log/YYYY-MM-DD__auto__cato.md.
+
+WINDOW LOGIC:
+  Default  — run only when the rate-limit state transitions LIMITED → READY
+             (i.e. at the start of a genuinely fresh capacity window).  Also
+             fires on the very first check if the state is already READY.
+  --always — run on every READY poll regardless of window history.  Combine
+             with --interval to implement a fixed-cadence schedule.
+  Note: READY flips to LIMITED once the 5-hour token budget is exhausted.
+  A single Sonnet/Opus task may consume enough tokens to trigger this, so
+  --always is only meaningful when individual rounds leave significant headroom
+  (e.g. many small Haiku tasks, or when your plan has high rate-limit capacity).
+
+WHY SONNET FOR SELECTION:
+  The selector reads the full task list and judges impact, autonomy, and
+  unblocking value.  Sonnet outperforms Haiku on this nuanced ranking at
+  negligible extra cost (selection is a single short call).
+
+MODEL/EFFORT RESOLUTION (highest → lowest priority):
+  Model:  task-line annotation  →  ### tier header  →  sonnet (default)
+  Effort: task-line/header annotation  →  explicit -e CLI flag
+          →  selector AI suggestion  →  xhigh (built-in default)
+
+  Task-line format:  - [ ] Task text — *model/effort*  (either or both)
+                     also accepts comma or dash as separator: *haiku, medium*
+  Header format:     ## Haiku — medium   or   ### Group — high
+                     minimum depth for tier headers is ## (same level as section
+                     headers is fine as long as the name contains a model keyword)
+  -m filters the task pool to tasks whose resolved model matches; it does
+  not override.  Tasks on the wrong tier are excluded before selection.
+  -e beats the selector's suggestion but not task/header annotations.
+
+FLAGS:
+  -t / --todo      Path to backlog (default: tdo/claude/tdo.md)
+  -m / --model     Filter to tasks whose resolved model matches (default: all tiers)
+  -g / --group     Filter tasks to those under a matching #### group header (prefix, case-insensitive)
+  -S / --selector  Model for task selection and reporting (default: sonnet)
+  -q / --queue     Instead of AI selection, take tasks simply from the top
+  -e / --effort    Fallback effort level: low medium high xhigh max (default: xhigh)
+  -n / --tasks     Tasks to execute per round (default: 1)
+  -a / --always    Run on every READY poll, not only at window resets
+  -i / --interval  Poll cadence in seconds when idle (default: 600)
+  -T / --timeout   Per-task execution timeout in seconds (default: 3600)
+  -x / --max-cost  Stop round early if window budget consumed exceeds PCT % (default: no cap)
+  -1 / --once      Execute one round and exit (non-daemon mode)
+  -d / --dry-run   Select tasks but skip execution (for testing)
+  -s / --status    Print rate-limit status and exit
+  -l / --list      List all eligible tasks from backlog and exit
+
+EXAMPLES:
+  bin/cato                           # 1 task per fresh window (default)
+  bin/cato -n 3 -e max               # 3 tasks at max effort per window
+  bin/cato -m opus -n 2 -1           # two opus tasks now, then exit
+  bin/cato -a -i 1800                # run every 30-min READY poll
+  bin/cato -g CATO                   # only accept tasks from group CATO
+  bin/cato -q -1                     # take first task in queue, no AI call
+  bin/cato -d -1                     # dry-run: select but skip execution
+  bin/cato -l                        # inspect the parsed task queue
+  bin/cato -s                        # check rate-limit headroom
+  nohup bin/cato > /tmp/cato.log 2>&1 &   # background daemon
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_TTY = sys.stdout.isatty()
+_RST = "\033[0m"
+_DIM = "\033[2m"
+_GRY = "\033[90m"
+_GRN = "\033[32m"
+_YEL = "\033[33m"
+_RED = "\033[31m"
+_CYN = "\033[36m"
+_BLD = "\033[1m"
+
+
+def _c(code: str, text: str) -> str:
+    return f"{code}{text}{_RST}" if _TTY else text
+
+
+def log(msg: str, level: str = "INFO") -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    if _TTY:
+        ts_fmt  = _c(_GRY, f"[{ts}]")
+        lvl_key = level.strip()
+        if lvl_key == "WARN":
+            lvl_fmt = _c(_YEL, f"{level:5}")
+        elif lvl_key == "ERROR":
+            lvl_fmt = _c(_RED + _BLD, f"{level:5}")
+        else:
+            lvl_fmt = _c(_DIM, f"{level:5}")
+        msg_fmt = msg.replace("✓", _c(_GRN, "✓")).replace("✗", _c(_RED, "✗"))
+        if msg.startswith("→ "):
+            msg_fmt = _c(_CYN, "→") + msg_fmt[1:]
+        print(f"{ts_fmt} {lvl_fmt} {msg_fmt}", flush=True)
+    else:
+        print(f"[{ts}] {level:5} {msg}", flush=True)
+
+
+def fmt_time(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+# ── Rate-limit status ─────────────────────────────────────────────────────────
+
+def get_rate_status() -> dict:
+    """Read stats-cache.json and return current rate-limit state."""
+    cache = Path.home() / ".claude" / "stats-cache.json"
+    if not cache.exists():
+        return {"state": "UNKNOWN", "detail": "~/.claude/stats-cache.json not found"}
+    try:
+        data = json.loads(cache.read_text())
+        limits = data.get("rate_limits", {}).get("five_hour", {})
+        used = limits.get("used_percentage", 0)
+        reset_ts = limits.get("resets_at", 0)
+        reset_in = max(0, int(reset_ts - time.time()))
+        # resets_at == 9999999999 is a sentinel meaning "no active countdown"
+        if reset_in > 6 * 3600:
+            reset_in = 0
+        if used >= 98:
+            return {"state": "LIMITED", "used": used, "reset_in": reset_in}
+        return {"state": "READY", "used": used, "reset_in": reset_in}
+    except Exception as exc:
+        return {"state": "ERROR", "detail": str(exc)}
+
+
+# ── Task parsing ──────────────────────────────────────────────────────────────
+
+# Sections to parse, mapped to their default execution model.
+# None means "derive from ### subsection name".
+# Substring-matched against the lowercased header key, so "sonnet — high"
+# matches "sonnet" and "## Claude" matches "claude" (legacy tdo/tdo.md).
+_SECTIONS = {
+    "claude": None,      # legacy: whole-file via a "## Claude" section
+    "sonnet": "sonnet",  # per-agent tdo: "## Sonnet" tier header
+    "opus":   "opus",    # per-agent tdo: "## Opus" tier header
+    "haiku":  "haiku",   # per-agent tdo: "## Haiku" tier header
+}
+
+_TIER_MODELS   = {"sonnet": "sonnet", "opus": "opus", "haiku": "haiku"}
+_MODEL_RANK    = {"haiku": 0, "sonnet": 1, "opus": 2}
+_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+
+
+def _clean(raw: str) -> str:
+    """Strip metadata annotations that aren't part of the task instruction."""
+    text = raw
+    # Remove chained trailing  — *...*  effort/cadence markers
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r"\s+—\s+\*[^*]+\*\s*$", "", text)
+    # Remove  🔗 [label](path)  cross-links
+    text = re.sub(r"\s*🔗\s*\[.*?\]\(.*?\)\s*", " ", text)
+    return text.strip()
+
+
+def _parse_annotations(raw: str) -> Tuple[Optional[str], Optional[str], str]:
+    """Extract — *model*, — *effort*, or — *model/effort* from trailing markers.
+    Returns (model, effort, cleaned_text)."""
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    for match in re.finditer(r"\s+—\s+\*([^*]+)\*", raw):
+        for part in re.split(r"\s*[/,\-]\s*", match.group(1).lower()):
+            part = part.strip()
+            if part in _TIER_MODELS:
+                model = _TIER_MODELS[part]
+            elif part in _EFFORT_LEVELS:
+                effort = part
+    return model, effort, _clean(raw)
+
+
+def parse_tasks(tdo_path: str, model_override: Optional[str] = None) -> List[dict]:
+    """
+    Return open tasks from tdo/claude/tdo.md (per-agent task backlog).
+    Each task dict: {text, model, native_model, effort, raw_line, section, subsection}.
+    ## opens/closes top-level sections; within an active section a ## header that
+    contains a tier name is treated as a tier header (minimum depth = ##); any deeper
+    header (###, ####, ...) with a tier name is also a tier header; other deep headers
+    are group headers that inherit the current model and may set effort.
+    Task-line annotations (— *model/effort*) take precedence over headers.
+    model_override filters: only tasks whose resolved model matches are returned.
+    [/] and [x] tasks are skipped automatically (regex only matches [ ]).
+    """
+    path = Path(tdo_path)
+    if not path.exists():
+        log(f"Backlog not found: {tdo_path}", "WARN ")
+        return []
+
+    tasks: List[dict] = []
+    in_section = False
+    current_section: Optional[str] = None
+    section_default = "sonnet"
+    current_model = "sonnet"
+    current_effort: Optional[str] = None
+    current_sub: Optional[str] = None
+
+    for line in path.read_text().splitlines():
+        s = line.strip()
+
+        # ── ## header: open/close section, or tier header within a section ──
+        if re.match(r"^## [^#]", s):
+            key = s.lstrip("#").strip().lower()
+            # Substring match so "## Sonnet — high" → "sonnet" and "## Claude" → "claude"
+            matched_sec = next((k for k in _SECTIONS if k in key), None)
+            if matched_sec is not None:
+                in_section = True
+                current_section = matched_sec
+                section_default = _SECTIONS[matched_sec] or "sonnet"
+                current_model = section_default
+                current_effort = None
+                current_sub = None
+                continue
+            elif in_section and any(tier in key for tier in _TIER_MODELS):
+                pass  # contains a tier name — fall through to tier/group detection
+            else:
+                in_section = False
+                current_section = None
+                continue
+
+        if not in_section:
+            continue
+
+        # ── Tier/group header (## that fell through, or ###, ####, …) ──────
+        if re.match(r"^#{2,}\s", s):
+            current_sub = s.lstrip("#").strip()
+            sub_lower = current_sub.lower()
+            matched_model = next(
+                (m for tier, m in _TIER_MODELS.items() if tier in sub_lower), None
+            )
+            if matched_model is not None:
+                current_model = matched_model
+                current_effort = next((e for e in _EFFORT_LEVELS if e in sub_lower), None)
+            else:
+                sub_effort = next((e for e in _EFFORT_LEVELS if e in sub_lower), None)
+                if sub_effort:
+                    current_effort = sub_effort
+            continue
+
+        # ── Open task ─────────────────────────────────────────────────────
+        m = re.match(r"^- \[ \] (.+)", s)
+        if m:
+            ann_model, ann_effort, text = _parse_annotations(m.group(1))
+            if len(text) > 10:
+                resolved_model = ann_model or current_model
+                if model_override and resolved_model != model_override:
+                    continue
+                tasks.append({
+                    "text": text,
+                    "model": model_override or resolved_model,
+                    "native_model": resolved_model,
+                    "effort": ann_effort or current_effort,
+                    "raw_line": s,  # original stripped line for in-place marking
+                    "section": current_section,
+                    "subsection": current_sub,
+                })
+
+    return tasks
+
+
+def _group_key(task: dict) -> str:
+    raw = task.get("subsection") or ""
+    return re.split(r"[\s(—]", raw)[0] if raw else "—"
+
+
+def filter_group(tasks: List[dict], group: Optional[str]) -> List[dict]:
+    if not group:
+        return tasks
+    prefix = group.lower()
+    return [t for t in tasks if _group_key(t).lower().startswith(prefix)]
+
+
+def mark_task(tdo_path: str, task: dict, status: str) -> None:
+    """Rewrite a task's checkbox in the backlog file. status: '/' = in-progress, 'x' = done."""
+    raw = task.get("raw_line")
+    if not raw:
+        return
+    path = Path(tdo_path)
+    content = path.read_text()
+    new_line = re.sub(r"^(- )\[[^\]]\]( )", rf"\1[{status}]\2", raw)
+    updated = content.replace(raw, new_line, 1)
+    if updated != content:
+        path.write_text(updated)
+        task["raw_line"] = new_line  # keep in sync so a subsequent mark finds the new line
+    else:
+        log(f"  Could not mark task in {tdo_path}", "WARN ")
+
+
+# ── Task selection ────────────────────────────────────────────────────────────
+
+def select_tasks(
+    tasks: List[dict], n: int, selector: str, dry_run: bool = False, queue: bool = False
+) -> List[dict]:
+    """
+    Select n tasks from the list.
+    queue=True: take the first n in queue order (no AI call).
+    Otherwise: ask the selector to rank by impact; for tasks without a
+    pre-specified effort it also suggests one (stored as suggested_effort so
+    CLI -e can still outrank it). Falls back to first n on error.
+    """
+    if queue or len(tasks) <= n:
+        return tasks[:n]
+
+    def task_label(t: dict) -> str:
+        return t["model"] + (f"/{t['effort']}" if t.get("effort") else "")
+
+    numbered = "\n".join(
+        f"{i+1}. [{task_label(t)}] {t['text']}" for i, t in enumerate(tasks)
+    )
+    needs_effort = any(not t.get("effort") for t in tasks)
+    if needs_effort:
+        reply_format = (
+            "Reply with ONLY a JSON array of [task_number, effort] pairs for your chosen "
+            f"task(s), e.g. [[3, \"high\"], [1, \"medium\"]]. "
+            "For tasks that already show an effort in their label (e.g. [sonnet/high]), "
+            "use null: [[2, null]].  Valid effort values: low medium high xhigh max."
+        )
+    else:
+        reply_format = (
+            "Reply with ONLY a JSON array of the chosen 1-based task numbers, e.g. [3] or [1,5]."
+        )
+    prompt = (
+        f"Select the {n} best task(s) from this backlog for immediate autonomous execution "
+        f"by an AI agent in the AIB repository.\n\n"
+        f"Prefer tasks that:\n"
+        f"• produce a concrete, verifiable output (a file written to a specific path)\n"
+        f"• are fully self-contained (all context is in the repo; no human input mid-task)\n"
+        f"• unblock other work or directly advance Phase 1 goals\n"
+        f"• are narrowly scoped rather than open-ended\n\n"
+        f"Tasks:\n{numbered}\n\n"
+        f"{reply_format}"
+    )
+
+    if dry_run:
+        log(f"[dry-run] Would select {n} from {len(tasks)} tasks via {selector}")
+        return tasks[:n]
+
+    try:
+        result = subprocess.run(
+            ["claude", "--model", selector, "-p"],
+            input=prompt, text=True, capture_output=True, timeout=60,
+        )
+        if result.returncode == 0:
+            hit = re.search(r"\[[\s\S]*\]", result.stdout)
+            if hit:
+                parsed = json.loads(hit.group())
+                if parsed and isinstance(parsed[0], list):
+                    pairs = [(int(item[0]), item[1] if len(item) > 1 else None)
+                             for item in parsed]
+                else:
+                    pairs = [(int(i), None) for i in parsed]
+                chosen = []
+                for raw_idx, suggested_effort in pairs[:n]:
+                    idx = raw_idx - 1
+                    if 0 <= idx < len(tasks):
+                        task = dict(tasks[idx])
+                        if not task.get("effort") and suggested_effort in _EFFORT_LEVELS:
+                            task["suggested_effort"] = suggested_effort
+                        chosen.append(task)
+                if chosen:
+                    log(f"Selector chose task(s): {[p[0] for p in pairs[:len(chosen)]]}")
+                    return chosen
+        log(f"Selector gave unparseable output — using first {n} task(s)", "WARN ")
+    except subprocess.TimeoutExpired:
+        log("Selector timed out — using first task(s)", "WARN ")
+    except Exception as exc:
+        log(f"Selector error: {exc} — using first task(s)", "WARN ")
+
+    return tasks[:n]
+
+
+# ── Task execution ────────────────────────────────────────────────────────────
+
+def run_task(
+    task: dict, effort_cli: Optional[str], timeout: int, dry_run: bool = False
+) -> Tuple[bool, str]:
+    """
+    Execute one task via `claude -p` in batch mode.
+    Returns (success, output_text).
+    Priority: annotation/header effort > explicit CLI -e > selector suggestion > xhigh.
+    Resolved effort is stored back in task["effort"] for the session log.
+    """
+    model, text = task["model"], task["text"]
+    effort = task.get("effort") or effort_cli or task.get("suggested_effort") or "xhigh"
+    task["effort"] = effort  # persist for session log
+    preview = text[:90] + ("…" if len(text) > 90 else "")
+    log(f"→ [{model}@{effort}] {preview}")
+
+    if dry_run:
+        log("  [dry-run] Skipping execution")
+        return True, "[dry-run]"
+
+    try:
+        result = subprocess.run(
+            ["claude", "--model", model, "--effort", effort, "-p", text],
+            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+        ok = result.returncode == 0
+        output = (result.stdout + result.stderr).strip()
+        if ok:
+            log(f"  ✓ Completed ({len(output)} chars)")
+        else:
+            log(f"  ✗ Failed (exit {result.returncode}): {output[:200]}", "WARN ")
+        return ok, output
+    except subprocess.TimeoutExpired:
+        log(f"  ✗ Timed out after {fmt_time(timeout)}", "WARN ")
+        return False, f"Timed out after {timeout}s"
+    except Exception as exc:
+        log(f"  ✗ Error: {exc}", "ERROR")
+        return False, str(exc)
+
+
+# ── Session logging ───────────────────────────────────────────────────────────
+
+def write_session_log(
+    session: List[Tuple[dict, Tuple[bool, str]]], tdo_path: str
+) -> None:
+    """Append this round's results to the daily CATO log file."""
+    Path("log").mkdir(exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now().strftime("%H:%M:%S")
+    path = Path(f"log/{today}__auto__cato.md")
+
+    ok_count = sum(1 for _, (ok, _) in session)
+    total = len(session)
+
+    lines = [f"\n## {now} — {ok_count}/{total} succeeded  (backlog: {tdo_path})\n"]
+    for i, (task, (ok, output)) in enumerate(session, 1):
+        mark = "✓" if ok else "✗"
+        eff = f"/{task['effort']}" if task.get("effort") else ""
+        sub = f" · {task['subsection']}" if task.get("subsection") else ""
+        lines.append(f"**{i}. {mark} [{task['model']}{eff}{sub}]** {task['text']}\n")
+        if output and output != "[dry-run]":
+            snippet = output[:2000] + ("…" if len(output) > 2000 else "")
+            lines.append("```")
+            lines.extend(snippet.splitlines())
+            lines.append("```\n")
+    lines.append("---")
+
+    body = "\n".join(lines) + "\n"
+
+    if path.exists():
+        path.write_text(path.read_text() + body)
+    else:
+        header = (
+            f"---\ndate-created: {today}\ntype: auto\ntags: [cato, autonomous]\n---\n\n"
+            f"# CATO Sessions — {today}\n"
+        )
+        path.write_text(header + body)
+
+    log(f"Session logged → {path}")
+
+
+# ── Orchestration loop ────────────────────────────────────────────────────────
+
+def orchestrate(args: argparse.Namespace) -> None:
+    """Poll rate-limit status and dispatch task rounds when appropriate."""
+    was_limited: Optional[bool] = None  # None = first poll (unknown prior state)
+    round_num = 0
+
+    interval_part = "" if args.once else f"  interval={fmt_time(args.interval)}"
+    log(
+        f"CATO starting — backlog={args.todo}  n={args.tasks}{interval_part}  "
+        f"effort={args.effort}  selector={args.selector}  always={args.always}"
+    )
+
+    while True:
+        status = get_rate_status()
+        state = status["state"]
+        used = status.get("used", 0.0)
+        reset_in = status.get("reset_in", 0)
+
+        if state == "READY":
+            fresh = was_limited is True or was_limited is None
+            should_run = fresh or args.always
+
+            if should_run:
+                reason = "fresh window" if fresh else "--always"
+                log(f"READY ({used:.0f}% used) — triggering round [{reason}]")
+
+                tasks = filter_group(parse_tasks(args.todo, model_override=args.model), args.group)
+                log(f"Parsed {len(tasks)} open task(s) from {args.todo}" + (f" [group: {args.group}]" if args.group else ""))
+
+                if not tasks:
+                    log("No eligible tasks found — skipping round", "WARN ")
+                else:
+                    selected = select_tasks(tasks, args.tasks, args.selector, args.dry_run, args.queue)
+                    log(f"Executing {len(selected)} task(s)...")
+
+                    session: List[Tuple[dict, Tuple[bool, str]]] = []
+                    budget_start = get_rate_status().get("used", 0.0)
+                    for task in selected:
+                        if not args.dry_run:
+                            mark_task(args.todo, task, "/")
+                        outcome = run_task(task, args.effort, args.timeout, args.dry_run)
+                        ok, _ = outcome
+                        if not args.dry_run and ok:
+                            mark_task(args.todo, task, "x")
+                        session.append((task, outcome))
+
+                        if args.max_cost is not None and not args.dry_run:
+                            consumed = max(0.0, get_rate_status().get("used", 0.0) - budget_start)
+                            if consumed >= args.max_cost:
+                                log(f"Budget cap reached ({consumed:.1f}% consumed ≥ {args.max_cost}% limit) — stopping round early", "WARN ")
+                                break
+
+                        if len(selected) > 1:
+                            time.sleep(10)  # brief cool-down between tasks
+
+                    write_session_log(session, args.todo)
+                    round_num += 1
+                    ok_count = sum(1 for _, (success, _) in session if success)
+                    next_check = datetime.now().timestamp() + args.interval
+                    next_str = datetime.fromtimestamp(next_check).strftime("%H:%M:%S")
+                    log(f"Round {round_num} done — {ok_count}/{len(session)} succeeded  (next check {next_str})")
+
+                if args.once:
+                    sys.exit(0)
+            else:
+                log(f"READY ({used:.0f}% used) — same window, holding (use -a to override)")
+
+            was_limited = False
+            time.sleep(args.interval)
+
+        elif state == "LIMITED":
+            log(f"Rate limited ({used:.0f}% used) — reset in {fmt_time(reset_in)}")
+            if args.once:
+                log("Rate limited on --once run — exiting", "WARN ")
+                sys.exit(1)
+            wait = min(reset_in + 30, 600)
+            log(f"Sleeping {fmt_time(wait)} before next check")
+            time.sleep(wait)
+            was_limited = True
+
+        else:
+            detail = status.get("detail", "")
+            log(f"Status {state}: {detail} — retry in {fmt_time(args.interval)}", "WARN ")
+            if args.once:
+                sys.exit(1)
+            time.sleep(args.interval)
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="cato",
+        description="CATO — Claude Autonomous Task Orchestrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    A = parser.add_argument
+    A("-t", "--todo",     default="tdo/claude/tdo.md", metavar="PATH",
+      help="Path to task backlog (default: tdo/claude/tdo.md)")
+    A("-m", "--model",    default=None, choices=["haiku", "sonnet", "opus"],
+      help="Override execution model for all tasks (default: per-tier from tdo.md)")
+    A("-e", "--effort",   default=None, metavar="LEVEL",
+      choices=["low", "medium", "high", "xhigh", "max"],
+      help="Effort override: beats selector suggestion but not task annotations (default: selector or xhigh)")
+    A("-n", "--tasks",    type=int, default=1, metavar="N",
+      help="Tasks to execute per round (default: 1)")
+    A("-S", "--selector", default="sonnet", choices=["haiku", "sonnet", "opus"],
+      help="Model for task selection (default: sonnet)")
+    A("-g", "--group",    default=None, metavar="NAME",
+      help="Filter tasks to those whose #### group matches NAME (case-insensitive prefix)")
+    A("-q", "--queue",    action="store_true",
+      help="Skip AI selection; take the first N tasks in queue order")
+    A("-a", "--always",   action="store_true",
+      help="Run on every READY poll, not only after a rate-limit reset")
+    A("-i", "--interval", type=int, default=600, metavar="SEC",
+      help="Poll interval in seconds when idle (default: 600)")
+    A("-T", "--timeout",  type=int, default=3600, metavar="SEC",
+      help="Per-task execution timeout in seconds (default: 3600)")
+    A("-x", "--max-cost", type=float, default=None, metavar="PCT",
+      help="Stop the round early if window budget consumed exceeds PCT %% (Pro/Max: quota; API: cost proxy)")
+    A("-1", "--once",     action="store_true",
+      help="Execute one round and exit (non-daemon mode)")
+    A("-s", "--status",   action="store_true",
+      help="Print current rate-limit status and exit")
+    A("-d", "--dry-run",  action="store_true",
+      help="Select tasks but skip execution")
+    A("-l", "--list",     action="store_true",
+      help="List all eligible tasks from backlog and exit")
+
+    args = parser.parse_args()
+
+    # Resolve tdo path: try parent dir if not found in cwd
+    if not Path(args.todo).exists():
+        alt = Path("..") / args.todo
+        if alt.exists():
+            os.chdir("..")  # run from repo root so claude has full file access
+
+    # ── status ──────────────────────────────────────────────────────────────
+    if args.status:
+        s = get_rate_status()
+        state, used, reset_in = s["state"], s.get("used", "?"), s.get("reset_in", 0)
+        if state == "READY":
+            suffix = f"  (resets in {fmt_time(reset_in)})" if reset_in else ""
+            print(f"READY   {used:.0f}% used{suffix}")
+        elif state == "LIMITED":
+            print(f"LIMITED {used:.0f}% used  (resets in {fmt_time(reset_in)})")
+        else:
+            print(f"{state}: {s.get('detail', '')}")
+        sys.exit(0)
+
+    # ── list ─────────────────────────────────────────────────────────────────
+    if args.list:
+        tasks = filter_group(parse_tasks(args.todo, model_override=args.model), args.group)
+        if not tasks:
+            suffix = f" in group '{args.group}'" if args.group else ""
+            print(f"No open tasks found in {args.todo}{suffix}")
+            sys.exit(0)
+        by_model: Dict[str, list] = {}
+        for t in tasks:
+            by_model.setdefault(t["model"], []).append(t)
+        TASK_W = 100
+        GRP_W  = 8
+        EFF_W  = 7
+        HDR  = f"  {'#':>3}  {'Group':<{GRP_W}}  {'Effort':<{EFF_W}}  Task"
+        SEP  = f"  {'-'*3}  {'-'*GRP_W}  {'-'*EFF_W}  {'-'*TASK_W}"
+        header = f"\nEligible tasks in {args.todo}"
+        if args.model:
+            header += f"  [model: {args.model}]"
+        if args.group:
+            header += f"  [group: {args.group}]"
+        print(header + ":\n")
+        for model in ["haiku", "sonnet", "opus"]:
+            tlist = by_model.get(model, [])
+            if not tlist:
+                continue
+            print(f"  {model.upper()} ({len(tlist)})")
+            print(HDR)
+            print(SEP)
+            for i, t in enumerate(tlist, 1):
+                preview = t["text"][:TASK_W] + ("…" if len(t["text"]) > TASK_W else "")
+                eff = t.get("effort") or "—"
+                print(f"  {i:>3}  {_group_key(t):<{GRP_W}}  {eff:<{EFF_W}}  {preview}")
+            print()
+        print(f"Total: {len(tasks)} tasks across {len(by_model)} tier(s)")
+        sys.exit(0)
+
+    orchestrate(args)
+
+
+if __name__ == "__main__":
+    main()

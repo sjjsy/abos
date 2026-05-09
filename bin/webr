@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+webr (Web Research) — web research helper using Tavily (REST) and Jina Reader.
+
+Usage:
+    webr "query"                    # Tavily search, print results
+    webr "query" -n 10              # Limit results
+    webr "query" --raw              # Include raw page content
+    webr --jina https://example.com # Fetch and clean a URL via Jina
+    webr --jina URL -o out.md       # Write Jina output to file
+
+Environment:
+    TAVILY_API_KEY  required for Tavily searches (set in .env at repo root)
+
+Python 3.8 note: tavily-python SDK uses 3.9+ syntax; this script calls
+the REST API directly via requests to avoid that incompatibility.
+
+Examples from the 2026-05-07 ABOS/Second Brain landscape sprint:
+    # Broad landscape sweeps (run in parallel via Claude multi-tool)
+    webr "agentic business operating system ABOS open source 2026" -n 8
+    webr "git markdown second brain AI agent team knowledge base 2026" -n 8
+    webr "OpenClaw SOUL.md AGENTS.md HEARTBEAT.md AI agent OS" -n 6
+
+    # Fetch primary sources discovered in search results
+    webr --jina https://github.com/openclaw/openclaw
+    webr --jina https://www.dsebastien.net/agentic-knowledge-management-the-next-evolution-of-pkm/
+
+    # Save a fetched page directly to a log file
+    webr --jina https://github.com/axoviq-ai/synthadoc -o log/2026-05-07__input__synthadoc.md
+"""
+
+import sys
+import os
+import argparse
+from pathlib import Path
+from typing import List, Optional
+
+try:
+    import requests
+except ImportError:
+    print("requests not installed: pip install requests")
+    sys.exit(1)
+
+
+def load_api_key() -> Optional[str]:
+    """Load Tavily API key from .env in repo root or environment."""
+    key = os.environ.get("TAVILY_API_KEY")
+    if key:
+        return key
+    # Walk up to find .env
+    here = Path(__file__).resolve().parent
+    for candidate in [here, here.parent, Path.cwd()]:
+        env_file = candidate / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("TAVILY_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    return None
+
+
+def tavily_search(query: str, max_results: int = 8, include_raw: bool = False) -> List[dict]:
+    """Search via Tavily REST API. Returns list of result dicts."""
+    key = load_api_key()
+    if not key:
+        print("Error: TAVILY_API_KEY not found. Set it in .env or as an environment variable.")
+        sys.exit(1)
+
+    resp = requests.post(
+        "https://api.tavily.com/search",
+        json={
+            "api_key": key,
+            "query": query,
+            "search_depth": "advanced",
+            "max_results": max_results,
+            "include_raw_content": include_raw,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json().get("results", [])
+
+
+def jina_fetch(url: str, max_chars: int = 8000) -> str:
+    """Fetch and clean a URL via Jina Reader. Returns markdown text."""
+    resp = requests.get(
+        f"https://r.jina.ai/{url}",
+        headers={"Accept": "text/plain"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.text[:max_chars]
+
+
+def print_results(results: List[dict], include_raw: bool = False) -> None:
+    for i, r in enumerate(results, 1):
+        print(f"\n{i}. {r['title']}")
+        print(f"   {r['url']}")
+        content = r.get("content", "").replace("\n", " ").strip()
+        if content:
+            print(f"   {content[:200]}")
+        if include_raw and r.get("raw_content"):
+            print(f"\n   --- raw ---\n{r['raw_content'][:1000]}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Search (Tavily) or fetch (Jina) for web research",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("query", nargs="?", help="Search query (Tavily)")
+    parser.add_argument("--jina", metavar="URL", help="Fetch and clean a URL via Jina Reader")
+    parser.add_argument("-n", "--max-results", type=int, default=8, help="Max Tavily results (default: 8)")
+    parser.add_argument("--raw", action="store_true", help="Include raw page content in Tavily results")
+    parser.add_argument("-o", "--output", metavar="FILE", help="Write Jina output to file instead of stdout")
+    parser.add_argument("--max-chars", type=int, default=8000, help="Max characters for Jina output (default: 8000)")
+
+    args = parser.parse_args()
+
+    if args.jina:
+        text = jina_fetch(args.jina, max_chars=args.max_chars)
+        if args.output:
+            Path(args.output).write_text(text)
+            print(f"Written to {args.output} ({len(text)} chars)")
+        else:
+            print(text)
+        return 0
+
+    if args.query:
+        results = tavily_search(args.query, max_results=args.max_results, include_raw=args.raw)
+        print(f"Tavily: {len(results)} results for '{args.query}'")
+        print_results(results, include_raw=args.raw)
+        return 0
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
